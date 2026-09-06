@@ -1,7 +1,8 @@
 import os
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from notion_client import Client as NotionClient
 from dotenv import load_dotenv
@@ -22,12 +23,15 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# Названия свойств (колонок) в базе Notion — должны совпадать с тем,
-# что вы создали в самой таблице Notion.
-PROP_TITLE = "Описание"     # title-свойство (в Notion у каждой базы обязательно есть одно)
-PROP_AMOUNT = "Сумма"       # number
+# Часовой пояс, по которому определяется "текущий месяц".
+TZ = ZoneInfo("Europe/Moscow")
+
+# Названия свойств (колонок) в базе Notion.
+PROP_TITLE = "Описание"     # title — сюда пишем "Категория — Месяц Год"
+PROP_AMOUNT = "Сумма"       # number — сумма трат по категории за месяц (накапливается)
 PROP_CATEGORY = "Категория" # select
-PROP_DATE = "Дата"          # date
+PROP_MONTH = "Месяц"        # select — ключ вида "2026-09", новая колонка, добавьте её в Notion
+PROP_DATE = "Дата"          # date — дата последнего обновления строки (для наглядности)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -36,10 +40,14 @@ logger = logging.getLogger(__name__)
 
 notion = NotionClient(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
+RU_MONTHS = {
+    1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель",
+    5: "Май", 6: "Июнь", 7: "Июль", 8: "Август",
+    9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь",
+}
+
 # ---------------------------------------------------------------------------
 # КАТЕГОРИИ И КЛЮЧЕВЫЕ СЛОВА
-# Отредактируйте под себя: ключ — название категории (то, что попадёт в таблицу),
-# значение — список слов, по которым бот будет её угадывать.
 # ---------------------------------------------------------------------------
 CATEGORIES = {
     "Продукты": ["продукт", "магазин", "супермаркет", "еда", "пятерочка", "перекресток", "ашан", "лента", "овощ", "фрукт"],
@@ -68,8 +76,6 @@ def detect_category(text: str) -> str:
 
 
 def parse_message(text: str):
-    """Достаёт сумму и описание из свободного текста вида
-    '500 продукты' или 'потратил 1500 на такси до аэропорта'."""
     match = AMOUNT_PATTERN.search(text)
     if not match:
         return None, None
@@ -84,28 +90,64 @@ def parse_message(text: str):
     return amount, description
 
 
+def current_month_key() -> str:
+    now = datetime.now(TZ)
+    return now.strftime("%Y-%m")
+
+
+def month_title(month_key: str, category: str) -> str:
+    year, month = month_key.split("-")
+    return f"{category} — {RU_MONTHS[int(month)]} {year}"
+
+
 # ---------------------------------------------------------------------------
-# NOTION
+# NOTION: одна строка = (месяц, категория), сумма в ней накапливается
 # ---------------------------------------------------------------------------
-def append_expense(amount: float, description: str, category: str) -> str:
-    """Создаёт страницу (строку) в базе Notion и возвращает её page_id."""
-    page = notion.pages.create(
-        parent={"database_id": NOTION_DATABASE_ID},
-        properties={
-            PROP_TITLE: {"title": [{"text": {"content": description}}]},
-            PROP_AMOUNT: {"number": amount},
-            PROP_CATEGORY: {"select": {"name": category}},
-            PROP_DATE: {"date": {"start": datetime.now(timezone.utc).isoformat()}},
+def find_month_category_page(month_key: str, category: str):
+    response = notion.databases.query(
+        database_id=NOTION_DATABASE_ID,
+        filter={
+            "and": [
+                {"property": PROP_MONTH, "select": {"equals": month_key}},
+                {"property": PROP_CATEGORY, "select": {"equals": category}},
+            ]
         },
+        page_size=1,
     )
-    return page["id"]
+    results = response.get("results", [])
+    return results[0] if results else None
 
 
-def update_category(page_id: str, category: str):
-    notion.pages.update(
-        page_id=page_id,
-        properties={PROP_CATEGORY: {"select": {"name": category}}},
-    )
+def add_to_category_total(month_key: str, category: str, delta: float) -> float:
+    """Прибавляет (или вычитает, если delta отрицательная) сумму к строке
+    месяц+категория. Создаёт строку, если её ещё нет. Возвращает новый итог."""
+    page = find_month_category_page(month_key, category)
+    today = datetime.now(TZ).date().isoformat()
+
+    if page:
+        current_total = page["properties"][PROP_AMOUNT]["number"] or 0
+        new_total = round(current_total + delta, 2)
+        notion.pages.update(
+            page_id=page["id"],
+            properties={
+                PROP_AMOUNT: {"number": new_total},
+                PROP_DATE: {"date": {"start": today}},
+            },
+        )
+        return new_total
+    else:
+        new_total = round(delta, 2)
+        notion.pages.create(
+            parent={"database_id": NOTION_DATABASE_ID},
+            properties={
+                PROP_TITLE: {"title": [{"text": {"content": month_title(month_key, category)}}]},
+                PROP_AMOUNT: {"number": new_total},
+                PROP_CATEGORY: {"select": {"name": category}},
+                PROP_MONTH: {"select": {"name": month_key}},
+                PROP_DATE: {"date": {"start": today}},
+            },
+        )
+        return new_total
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +157,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пиши мне траты в свободной форме, например:\n"
         "«500 продукты» или «потратил 1200 на такси»\n\n"
-        "Я сам определю категорию и запишу в таблицу Notion."
+        "Я определю категорию и прибавлю сумму к итогу этой категории за текущий месяц."
     )
 
 
@@ -130,23 +172,31 @@ async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     category = detect_category(description)
+    month_key = current_month_key()
 
     try:
-        page_id = append_expense(amount, description, category)
+        new_total = add_to_category_total(month_key, category, amount)
     except Exception as e:
         logger.exception("Ошибка записи в Notion")
         await update.message.reply_text(f"Не получилось записать в Notion: {e}")
         return
 
-    # page_id без дефисов короче — экономим место в callback_data (лимит 64 байта)
-    short_id = page_id.replace("-", "")
+    # Запоминаем последнюю операцию — понадобится, если нажмут "исправить категорию"
+    context.user_data["last_entry"] = {
+        "amount": amount,
+        "category": category,
+        "month_key": month_key,
+    }
+
     keyboard = [
-        [InlineKeyboardButton(cat, callback_data=f"fix|{short_id}|{i}")]
+        [InlineKeyboardButton(cat, callback_data=f"fix|{i}")]
         for i, cat in enumerate(CATEGORY_LIST)
     ]
 
     await update.message.reply_text(
-        f"Записал: {amount:.2f} — {description}\nКатегория: {category}\n\n"
+        f"Записал: {amount:.2f} — {description}\n"
+        f"Категория: {category}\n"
+        f"Итого по «{category}» за {RU_MONTHS[int(month_key.split('-')[1])]}: {new_total:.2f}\n\n"
         f"Если категория неверная, выбери правильную:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -155,14 +205,39 @@ async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_category_fix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    _, short_id, idx = query.data.split("|")
-    category = CATEGORY_LIST[int(idx)]
+
+    last_entry = context.user_data.get("last_entry")
+    if not last_entry:
+        await query.edit_message_text(
+            "Не могу исправить — прошло слишком много времени с момента записи "
+            "(бот помнит только последнюю операцию)."
+        )
+        return
+
+    _, idx = query.data.split("|")
+    new_category = CATEGORY_LIST[int(idx)]
+    old_category = last_entry["category"]
+    amount = last_entry["amount"]
+    month_key = last_entry["month_key"]
+
+    if new_category == old_category:
+        await query.edit_message_text(f"Категория уже «{new_category}» ✅")
+        return
+
     try:
-        update_category(short_id, category)
-        await query.edit_message_text(f"Категория обновлена на: {category} ✅")
+        add_to_category_total(month_key, old_category, -amount)
+        add_to_category_total(month_key, new_category, amount)
     except Exception as e:
-        logger.exception("Ошибка обновления категории")
-        await query.edit_message_text(f"Не получилось обновить категорию: {e}")
+        logger.exception("Ошибка при исправлении категории")
+        await query.edit_message_text(f"Не получилось исправить категорию: {e}")
+        return
+
+    last_entry["category"] = new_category
+    context.user_data["last_entry"] = last_entry
+
+    await query.edit_message_text(
+        f"Перенёс {amount:.2f} из «{old_category}» в «{new_category}» ✅"
+    )
 
 
 def main():
