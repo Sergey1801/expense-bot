@@ -163,8 +163,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пиши мне траты в свободной форме, например:\n"
         "«500 еда» или «потратил 1200 на бензин»\n\n"
-        "Я определю категорию и прибавлю сумму к текущему месяцу в таблице."
+        "Я определю категорию и прибавлю сумму к текущему месяцу в таблице.\n\n"
+        "Команда /month — покажет сумму по всем категориям за текущий месяц."
     )
+
+
+async def cmd_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month_name = current_month_name()
+
+    try:
+        response = notion.databases.query(database_id=NOTION_DATABASE_ID, page_size=100)
+    except Exception as e:
+        logger.exception("Ошибка чтения из Notion")
+        await update.message.reply_text(f"Не получилось прочитать таблицу: {e}")
+        return
+
+    order = {category: i for i, category in enumerate(CATEGORY_LIST)}
+    rows = []
+    total = 0.0
+
+    for page in response.get("results", []):
+        title_list = page["properties"].get(PROP_TITLE, {}).get("title", [])
+        category = title_list[0]["plain_text"] if title_list else "—"
+        amount = 0.0
+        month_prop = page["properties"].get(month_name)
+        if month_prop and month_prop.get("number") is not None:
+            amount = month_prop["number"]
+        rows.append((category, amount))
+        total += amount
+
+    rows.sort(key=lambda row: order.get(row[0], 999))
+
+    lines = [f"📊 Траты за {month_name}:\n"]
+    for category, amount in rows:
+        lines.append(f"{category}: {amount:.2f}")
+    lines.append(f"\nИтого: {total:.2f}")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def handle_expense(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,6 +290,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("month", cmd_month))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_expense))
     app.add_handler(CallbackQueryHandler(handle_category_fix, pattern=r"^fix\|"))
 
